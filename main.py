@@ -4,8 +4,9 @@
 import sys
 import time
 import csv
+import struct
+import socket
 import threading
-import ctypes
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -22,138 +23,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.ticker as ticker
 
 
-BUCKET_SECS = 60        # one graph point per minute
-MAX_BUCKETS = 60        # 60 minutes of history
-REFRESH_MS  = 2_000     # table redraw interval
-GRAPH_MS    = 10_000    # graph redraw interval
-POLL_SECS   = 2         # how often to read TCP stats
+BUCKET_SECS  = 60       # one graph point per minute
+MAX_BUCKETS  = 60       # 60 minutes of history
+REFRESH_MS   = 2_000    # table redraw interval
+GRAPH_MS     = 10_000   # graph redraw interval
+CACHE_SECS   = 3        # port->pid refresh interval
 
 
-# ── Windows API ───────────────────────────────────────────────────────────────
-
-if sys.platform == 'win32':
-    import ctypes.wintypes as _wt
-
-    _iphlp = ctypes.WinDLL('iphlpapi.dll', use_last_error=True)
-
-    class _MIB_TCPROW(ctypes.Structure):
-        _fields_ = [
-            ('dwState',      _wt.DWORD),
-            ('dwLocalAddr',  _wt.DWORD),
-            ('dwLocalPort',  _wt.DWORD),
-            ('dwRemoteAddr', _wt.DWORD),
-            ('dwRemotePort', _wt.DWORD),
-        ]
-
-    class _MIB_TCPROW_PID(ctypes.Structure):
-        _fields_ = [
-            ('dwState',      _wt.DWORD),
-            ('dwLocalAddr',  _wt.DWORD),
-            ('dwLocalPort',  _wt.DWORD),
-            ('dwRemoteAddr', _wt.DWORD),
-            ('dwRemotePort', _wt.DWORD),
-            ('dwOwningPid',  _wt.DWORD),
-        ]
-
-    class _ESTATS_DATA_RW(ctypes.Structure):
-        _fields_ = [('EnableCollection', ctypes.c_byte)]
-
-    class _ESTATS_DATA_ROD(ctypes.Structure):
-        _fields_ = [
-            ('DataBytesOut',    ctypes.c_uint64),
-            ('DataSegsOut',     ctypes.c_uint64),
-            ('DataBytesIn',     ctypes.c_uint64),
-            ('DataSegsIn',      ctypes.c_uint64),
-            ('SegsIn',          ctypes.c_uint64),
-            ('SegsOut',         ctypes.c_uint64),
-            ('SoftErrors',      _wt.DWORD),
-            ('SoftErrorReason', _wt.DWORD),
-        ]
-
-    _TCP_TABLE_OWNER_PID_ALL = 5
-    _AF_INET                 = 2
-    _TcpConnectionEstatsData = 1
-
-    # Explicit argtypes prevent 64-bit pointer truncation
-    _iphlp.GetExtendedTcpTable.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(_wt.DWORD),
-        _wt.BOOL, _wt.DWORD, ctypes.c_int, _wt.DWORD,
-    ]
-    _iphlp.GetExtendedTcpTable.restype = _wt.DWORD
-
-    _iphlp.SetPerTcpConnectionEStats.argtypes = [
-        ctypes.POINTER(_MIB_TCPROW), ctypes.c_int,
-        ctypes.c_void_p, _wt.DWORD, _wt.DWORD, _wt.DWORD,
-    ]
-    _iphlp.SetPerTcpConnectionEStats.restype = _wt.DWORD
-
-    _iphlp.GetPerTcpConnectionEStats.argtypes = [
-        ctypes.POINTER(_MIB_TCPROW), ctypes.c_int,
-        ctypes.c_void_p, _wt.DWORD, _wt.DWORD,
-        ctypes.c_void_p, _wt.DWORD, _wt.DWORD,
-        ctypes.c_void_p, _wt.DWORD, _wt.DWORD,
-    ]
-    _iphlp.GetPerTcpConnectionEStats.restype = _wt.DWORD
-
-    def _get_tcp_table():
-        size = _wt.DWORD(0)
-        _iphlp.GetExtendedTcpTable(None, ctypes.byref(size), False,
-                                    _AF_INET, _TCP_TABLE_OWNER_PID_ALL, 0)
-        buf = (ctypes.c_byte * size.value)()
-        if _iphlp.GetExtendedTcpTable(buf, ctypes.byref(size), False,
-                                       _AF_INET, _TCP_TABLE_OWNER_PID_ALL, 0):
-            return []
-        n   = _wt.DWORD.from_buffer_copy(bytes(buf[:4])).value
-        sz  = ctypes.sizeof(_MIB_TCPROW_PID)
-        out = []
-        off = 4
-        for _ in range(n):
-            pr = _MIB_TCPROW_PID.from_buffer_copy(bytes(buf[off:off + sz]))
-            if pr.dwOwningPid and pr.dwRemoteAddr:   # skip LISTEN / no PID
-                base = _MIB_TCPROW(
-                    dwState=pr.dwState,
-                    dwLocalAddr=pr.dwLocalAddr,
-                    dwLocalPort=pr.dwLocalPort,
-                    dwRemoteAddr=pr.dwRemoteAddr,
-                    dwRemotePort=pr.dwRemotePort,
-                )
-                out.append((pr.dwOwningPid, base))
-            off += sz
-        return out
-
-    def _enable(row):
-        rw = _ESTATS_DATA_RW(EnableCollection=1)
-        _iphlp.SetPerTcpConnectionEStats(
-            ctypes.byref(row), _TcpConnectionEstatsData,
-            ctypes.byref(rw), 0, ctypes.sizeof(rw), 0)
-
-    def _read(row):
-        rod = _ESTATS_DATA_ROD()
-        ret = _iphlp.GetPerTcpConnectionEStats(
-            ctypes.byref(row), _TcpConnectionEstatsData,
-            None, 0, 0,
-            None, 0, 0,
-            ctypes.byref(rod), 0, ctypes.sizeof(rod))
-        return (rod.DataBytesOut, rod.DataBytesIn) if ret == 0 else None
-
-else:
-    # Non-Windows stub so the file imports cleanly on dev machines
-    def _get_tcp_table():
-        return []
-    def _enable(row): pass
-    def _read(row):   return None
-
-
-def is_admin():
-    if sys.platform != 'win32':
-        return True
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-# ── Data store ────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _fmt(b):
     for u in ('B', 'KB', 'MB', 'GB'):
@@ -163,11 +40,13 @@ def _fmt(b):
     return f'{b:.1f} TB'
 
 
+# ── Data store ────────────────────────────────────────────────────────────────
+
 class Store:
     def __init__(self):
-        self._lk    = threading.Lock()
-        self._data  = defaultdict(lambda: [0, 0])   # pid -> [sent, recv]
-        self._names = {}                             # pid -> name (cached)
+        self._lk   = threading.Lock()
+        self._data = defaultdict(lambda: [0, 0])   # pid -> [sent, recv]
+        self._names = {}                            # pid -> name (cached)
         self._bkts  = deque(maxlen=MAX_BUCKETS)
         self._bkt_t = time.time()
         self._bkt_b = 0
@@ -224,70 +103,123 @@ class Store:
         return [hdr] + body
 
 
-# ── TCP monitor (Windows IP Helper API) ──────────────────────────────────────
+# ── Network monitor — Windows raw sockets ─────────────────────────────────────
 
-class TCPMonitor:
+class Monitor:
     """
-    Uses GetPerTcpConnectionEStats (iphlpapi.dll) to track per-connection
-    byte counts and attributes them to their owning PID.
-    No packet capture driver required.
+    Captures all IP traffic using Windows raw sockets + SIO_RCVALL.
+    No Npcap or third-party driver needed — requires Admin only.
+    One socket per active network interface (including cell modem).
+    Uses psutil.net_connections() to map ports -> PIDs.
     """
 
     def __init__(self, store):
-        self._store   = store
-        self._prev    = {}   # conn_key -> (bytes_out, bytes_in)
-        self._enabled = set()
+        self._store     = store
+        self._cache     = {}          # (local_port, proto) -> pid
+        self._cache_lk  = threading.Lock()
 
-    def poll(self):
+    # ── port->pid cache ───────────────────────────────────────────────────────
+
+    def _refresh_cache(self):
         try:
-            table = _get_tcp_table()
-        except Exception:
-            return
-
-        current = set()
-
-        for pid, row in table:
-            try:
-                key = (row.dwLocalAddr, row.dwLocalPort,
-                       row.dwRemoteAddr, row.dwRemotePort)
-                current.add(key)
-
-                if key not in self._enabled:
-                    _enable(row)
-                    self._enabled.add(key)
-                    continue   # first poll: baseline on next tick
-
-                result = _read(row)
-                if result is None:
+            conns = psutil.net_connections(kind='inet')
+            m = {}
+            for c in conns:
+                if not (c.laddr and c.pid):
                     continue
-                out, inp = result
+                proto = 'tcp' if c.type == socket.SOCK_STREAM else 'udp'
+                m[(c.laddr.port, proto)] = c.pid
+                try:
+                    self._store.cache_name(c.pid, psutil.Process(c.pid).name())
+                except Exception:
+                    pass
+            with self._cache_lk:
+                self._cache = m
+        except Exception:
+            pass
 
-                if key in self._prev:
-                    d_out = max(0, out - self._prev[key][0])
-                    d_in  = max(0, inp - self._prev[key][1])
-                    if d_out or d_in:
-                        self._store.record(pid, d_out, d_in)
-                        try:
-                            self._store.cache_name(pid, psutil.Process(pid).name())
-                        except Exception:
-                            pass
-
-                self._prev[key] = (out, inp)
-            except Exception:
-                continue   # bad connection never kills the loop
-
-        for key in list(self._prev):
-            if key not in current:
-                del self._prev[key]
-                self._enabled.discard(key)
-
-    def run(self):
+    def _cache_loop(self):
         while True:
+            self._refresh_cache()
+            time.sleep(CACHE_SECS)
+
+    # ── packet parser ─────────────────────────────────────────────────────────
+
+    def _parse(self, data):
+        """Return (src_port, dst_port, proto, ip_total_len) or None."""
+        if len(data) < 20:
+            return None
+        ver_ihl = data[0]
+        ihl     = (ver_ihl & 0xF) * 4
+        proto   = data[9]
+        total_len = struct.unpack_from('!H', data, 2)[0]
+
+        if proto == 6 and len(data) >= ihl + 4:    # TCP
+            sp, dp = struct.unpack_from('!HH', data, ihl)
+            return sp, dp, 'tcp', total_len
+        if proto == 17 and len(data) >= ihl + 4:   # UDP
+            sp, dp = struct.unpack_from('!HH', data, ihl)
+            return sp, dp, 'udp', total_len
+        return None
+
+    # ── per-interface sniffer ─────────────────────────────────────────────────
+
+    def _sniff(self, ip_addr):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+            s.bind((ip_addr, 0))
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+            s.settimeout(1.0)
+        except Exception:
+            return   # interface doesn't support raw capture; skip silently
+
+        try:
+            while True:
+                try:
+                    data, _ = s.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+
+                parsed = self._parse(data)
+                if not parsed:
+                    continue
+                sp, dp, proto, size = parsed
+
+                with self._cache_lk:
+                    pid = self._cache.get((sp, proto)) or self._cache.get((dp, proto))
+
+                if pid:
+                    sent = bool(self._cache.get((sp, proto)))
+                    self._store.record(pid, size if sent else 0,
+                                           0 if sent else size)
+        finally:
             try:
-                self.poll()
+                s.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                s.close()
             except Exception:
                 pass
-            time.sleep(POLL_SECS)
+
+    # ── entry point ───────────────────────────────────────────────────────────
+
+    def run(self):
+        self._refresh_cache()
+        threading.Thread(target=self._cache_loop, daemon=True, name='cache').start()
+
+        # Bind to every active non-loopback IPv4 interface
+        bound = 0
+        for addrs in psutil.net_if_addrs().values():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith('127.'):
+                    threading.Thread(target=self._sniff, args=(addr.address,),
+                                     daemon=True, name=f'sniff-{addr.address}').start()
+                    bound += 1
+
+        if not bound:   # fallback — shouldn't happen on a machine with network
+            threading.Thread(target=self._sniff, args=('0.0.0.0',),
+                             daemon=True, name='sniff-any').start()
 
 
 # ── Window ────────────────────────────────────────────────────────────────────
@@ -445,9 +377,9 @@ def _make_icon():
 
 def main():
     store   = Store()
-    monitor = TCPMonitor(store)
+    monitor = Monitor(store)
 
-    threading.Thread(target=monitor.run, daemon=True, name='tcp-monitor').start()
+    threading.Thread(target=monitor.run, daemon=True, name='monitor').start()
 
     win = Window(store)
 
@@ -471,7 +403,7 @@ def main():
     )
 
     threading.Thread(target=icon.run, daemon=True, name='tray').start()
-    win.hide()          # start minimized to tray
+    win.hide()
     win.root.mainloop()
 
 
