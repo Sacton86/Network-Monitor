@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and build
+        run: |
+          pip install psutil pystray Pillow matplotlib pyinstaller
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name NetWatch `
+            --uac-admin `
+            --hidden-import matplotlib.backends.backend_tkagg `
+            --hidden-import matplotlib.figure `
+            --hidden-import pystray._win32 `
+            --collect-data matplotlib `
+            main.py
+
+      - name: Attach exe to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/NetWatch.exe
