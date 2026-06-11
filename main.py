@@ -70,9 +70,30 @@ if sys.platform == 'win32':
             ('SoftErrorReason', _wt.DWORD),
         ]
 
-    _TCP_TABLE_OWNER_PID_ALL  = 5
-    _AF_INET                  = 2
-    _TcpConnectionEstatsData  = 1
+    _TCP_TABLE_OWNER_PID_ALL = 5
+    _AF_INET                 = 2
+    _TcpConnectionEstatsData = 1
+
+    # Explicit argtypes prevent 64-bit pointer truncation
+    _iphlp.GetExtendedTcpTable.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_wt.DWORD),
+        _wt.BOOL, _wt.DWORD, ctypes.c_int, _wt.DWORD,
+    ]
+    _iphlp.GetExtendedTcpTable.restype = _wt.DWORD
+
+    _iphlp.SetPerTcpConnectionEStats.argtypes = [
+        ctypes.POINTER(_MIB_TCPROW), ctypes.c_int,
+        ctypes.c_void_p, _wt.DWORD, _wt.DWORD, _wt.DWORD,
+    ]
+    _iphlp.SetPerTcpConnectionEStats.restype = _wt.DWORD
+
+    _iphlp.GetPerTcpConnectionEStats.argtypes = [
+        ctypes.POINTER(_MIB_TCPROW), ctypes.c_int,
+        ctypes.c_void_p, _wt.DWORD, _wt.DWORD,
+        ctypes.c_void_p, _wt.DWORD, _wt.DWORD,
+        ctypes.c_void_p, _wt.DWORD, _wt.DWORD,
+    ]
+    _iphlp.GetPerTcpConnectionEStats.restype = _wt.DWORD
 
     def _get_tcp_table():
         size = _wt.DWORD(0)
@@ -82,10 +103,10 @@ if sys.platform == 'win32':
         if _iphlp.GetExtendedTcpTable(buf, ctypes.byref(size), False,
                                        _AF_INET, _TCP_TABLE_OWNER_PID_ALL, 0):
             return []
-        n      = _wt.DWORD.from_buffer_copy(bytes(buf[:4])).value
-        sz     = ctypes.sizeof(_MIB_TCPROW_PID)
-        result = []
-        off    = 4
+        n   = _wt.DWORD.from_buffer_copy(bytes(buf[:4])).value
+        sz  = ctypes.sizeof(_MIB_TCPROW_PID)
+        out = []
+        off = 4
         for _ in range(n):
             pr = _MIB_TCPROW_PID.from_buffer_copy(bytes(buf[off:off + sz]))
             if pr.dwOwningPid and pr.dwRemoteAddr:   # skip LISTEN / no PID
@@ -96,16 +117,15 @@ if sys.platform == 'win32':
                     dwRemoteAddr=pr.dwRemoteAddr,
                     dwRemotePort=pr.dwRemotePort,
                 )
-                result.append((pr.dwOwningPid, base))
+                out.append((pr.dwOwningPid, base))
             off += sz
-        return result
+        return out
 
     def _enable(row):
         rw = _ESTATS_DATA_RW(EnableCollection=1)
         _iphlp.SetPerTcpConnectionEStats(
             ctypes.byref(row), _TcpConnectionEstatsData,
-            ctypes.cast(ctypes.byref(rw), ctypes.c_char_p),
-            0, ctypes.sizeof(rw), 0)
+            ctypes.byref(rw), 0, ctypes.sizeof(rw), 0)
 
     def _read(row):
         rod = _ESTATS_DATA_ROD()
@@ -113,8 +133,7 @@ if sys.platform == 'win32':
             ctypes.byref(row), _TcpConnectionEstatsData,
             None, 0, 0,
             None, 0, 0,
-            ctypes.cast(ctypes.byref(rod), ctypes.c_char_p),
-            0, ctypes.sizeof(rod))
+            ctypes.byref(rod), 0, ctypes.sizeof(rod))
         return (rod.DataBytesOut, rod.DataBytesIn) if ret == 0 else None
 
 else:
@@ -228,33 +247,35 @@ class TCPMonitor:
         current = set()
 
         for pid, row in table:
-            key = (row.dwLocalAddr, row.dwLocalPort,
-                   row.dwRemoteAddr, row.dwRemotePort)
-            current.add(key)
+            try:
+                key = (row.dwLocalAddr, row.dwLocalPort,
+                       row.dwRemoteAddr, row.dwRemotePort)
+                current.add(key)
 
-            if key not in self._enabled:
-                _enable(row)
-                self._enabled.add(key)
-                continue   # first poll for this conn; baseline on next tick
+                if key not in self._enabled:
+                    _enable(row)
+                    self._enabled.add(key)
+                    continue   # first poll: baseline on next tick
 
-            result = _read(row)
-            if result is None:
-                continue
-            out, inp = result
+                result = _read(row)
+                if result is None:
+                    continue
+                out, inp = result
 
-            if key in self._prev:
-                d_out = max(0, out - self._prev[key][0])
-                d_in  = max(0, inp - self._prev[key][1])
-                if d_out or d_in:
-                    self._store.record(pid, d_out, d_in)
-                    try:
-                        self._store.cache_name(pid, psutil.Process(pid).name())
-                    except Exception:
-                        pass
+                if key in self._prev:
+                    d_out = max(0, out - self._prev[key][0])
+                    d_in  = max(0, inp - self._prev[key][1])
+                    if d_out or d_in:
+                        self._store.record(pid, d_out, d_in)
+                        try:
+                            self._store.cache_name(pid, psutil.Process(pid).name())
+                        except Exception:
+                            pass
 
-            self._prev[key] = (out, inp)
+                self._prev[key] = (out, inp)
+            except Exception:
+                continue   # bad connection never kills the loop
 
-        # Remove closed connections
         for key in list(self._prev):
             if key not in current:
                 del self._prev[key]
@@ -262,7 +283,10 @@ class TCPMonitor:
 
     def run(self):
         while True:
-            self.poll()
+            try:
+                self.poll()
+            except Exception:
+                pass
             time.sleep(POLL_SECS)
 
 
